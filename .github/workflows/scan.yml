@@ -1,1 +1,41 @@
+name: Docker Image Vulnerability Scan
 
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 8 * * 1'   # Runs every Monday at 8am UTC
+  workflow_dispatch:        # Allows manual trigger from GitHub UI
+
+jobs:
+  scan:
+    name: Scan Docker Image with Trivy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pull Docker image from Docker Hub
+        run: docker pull pcornetqf/qf-r-base:latest
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pcornetqf/qf-r-base:latest'
+          format: 'table'
+          exit-code: '0'           # Set to '1' to FAIL the job if vulns found
+          ignore-unfixed: false
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          output: 'trivy-report.txt'
+
+      - name: Upload scan report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-vulnerability-report
+          path: trivy-report.txt
+          retention-days: 30
+
+      - name: Print report to job log
+        run: cat trivy-report.txt
