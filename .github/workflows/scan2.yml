@@ -1,0 +1,30 @@
+- name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pcornetqf/qf-r-base:latest'
+          format: 'template'
+          template: '@/contrib/html.tpl'
+          exit-code: '0'
+          ignore-unfixed: false
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          output: 'trivy-report.html'
+
+      - name: Install Chromium for PDF conversion
+        run: sudo apt-get install -y chromium-browser
+
+      - name: Convert HTML report to PDF
+        run: |
+          chromium-browser \
+            --headless \
+            --no-sandbox \
+            --print-to-pdf=trivy-report.pdf \
+            --print-to-pdf-no-header \
+            trivy-report.html
+
+      - name: Upload PDF report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-vulnerability-report-pdf
+          path: trivy-report.pdf
+          retention-days: 30
