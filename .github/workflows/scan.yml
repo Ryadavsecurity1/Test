@@ -12,68 +12,101 @@ jobs:
     name: Scan Docker Image with Trivy
     runs-on: ubuntu-latest
 
+    # Required permissions to commit files back to the repo
+    permissions:
+      contents: write
+
     steps:
       # ── 1. Checkout repo ──────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Pull the Docker image from Docker Hub ──────────────────────────
+      # ── 2. Generate a timestamp for file naming ───────────────────────────
+      - name: Set timestamp
+        run: echo "DATETIME=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
+
+      # ── 3. Create required directories ────────────────────────────────────
+      - name: Create required directories
+        run: |
+          mkdir -p scan-results
+          mkdir -p trivy-templates
+
+      # ── 4. Pull the Docker image from Docker Hub ──────────────────────────
       - name: Pull Docker image
         run: docker pull pcornetqf/qf-r-base:latest
 
-      # ── 3. Generate HTML report ───────────────────────────────────────────
-      - name: Run Trivy scanner (HTML output)
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'pcornetqf/qf-r-base:latest'
-          format: 'template'
-          template: '@/contrib/html.tpl'
-          exit-code: '0'
-          ignore-unfixed: false
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
-          output: 'trivy-report.html'
+      # ── 5. Install Trivy directly via official install script ─────────────
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      # ── 4. Install Chromium for PDF conversion ────────────────────────────
+      # ── 6. Download Trivy HTML template ───────────────────────────────────
+      - name: Download Trivy HTML template
+        run: |
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl \
+            -o trivy-templates/html.tpl
+
+      # ── 7. Generate HTML report via direct Trivy CLI call ─────────────────
+      - name: Run Trivy scanner (HTML output)
+        run: |
+          trivy image \
+            --format template \
+            --template "@trivy-templates/html.tpl" \
+            --output "scan-results/trivy-report_${{ env.DATETIME }}.html" \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            pcornetqf/qf-r-base:latest
+
+      # ── 8. Install Chromium for PDF conversion ────────────────────────────
       - name: Install Chromium
         run: |
           sudo apt-get update -y
           sudo apt-get install -y chromium-browser
 
-      # ── 5. Convert HTML → PDF ─────────────────────────────────────────────
+      # ── 9. Convert HTML → PDF ─────────────────────────────────────────────
       - name: Convert HTML report to PDF
         run: |
           chromium-browser \
             --headless \
             --no-sandbox \
             --disable-gpu \
-            --print-to-pdf="trivy-report.pdf" \
+            --print-to-pdf="scan-results/trivy-report_${{ env.DATETIME }}.pdf" \
             --print-to-pdf-no-header \
-            "$(pwd)/trivy-report.html"
+            "$(pwd)/scan-results/trivy-report_${{ env.DATETIME }}.html"
 
-      # ── 6. Print summary to job log ───────────────────────────────────────
+      # ── 10. Print summary table to job log ────────────────────────────────
       - name: Run Trivy scanner (table log output)
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'pcornetqf/qf-r-base:latest'
-          format: 'table'
-          exit-code: '0'
-          ignore-unfixed: false
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        run: |
+          trivy image \
+            --format table \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            pcornetqf/qf-r-base:latest
 
-      # ── 7. Upload HTML artifact ───────────────────────────────────────────
+      # ── 11. Commit and push reports to repo ───────────────────────────────
+      - name: Commit scan results to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scan-results/
+          git commit -m "scan: add vulnerability report for ${{ env.DATETIME }}"
+          git push
+
+      # ── 12. Upload HTML artifact ──────────────────────────────────────────
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-report-html
-          path: trivy-report.html
+          name: trivy-report-html_${{ env.DATETIME }}
+          path: scan-results/trivy-report_${{ env.DATETIME }}.html
           retention-days: 30
 
-      # ── 8. Upload PDF artifact ────────────────────────────────────────────
+      # ── 13. Upload PDF artifact ───────────────────────────────────────────
       - name: Upload PDF report
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-report-pdf
-          path: trivy-report.pdf
+          name: trivy-report-pdf_${{ env.DATETIME }}
+          path: scan-results/trivy-report_${{ env.DATETIME }}.pdf
           retention-days: 30
