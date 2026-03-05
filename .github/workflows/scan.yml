@@ -9,7 +9,7 @@ on:
 
 jobs:
   scan:
-    name: Scan Docker Image with Trivy
+    name: Scan Docker Image
     runs-on: ubuntu-latest
 
     # Required permissions to commit files back to the repo
@@ -28,14 +28,22 @@ jobs:
       # ── 3. Create required directories ────────────────────────────────────
       - name: Create required directories
         run: |
-          mkdir -p scan-results
+          mkdir -p scan-results/trivy
+          mkdir -p scan-results/grype
+          mkdir -p scan-results/syft
+          mkdir -p scan-results/clamav
           mkdir -p trivy-templates
+          mkdir -p image-contents
 
       # ── 4. Pull the Docker image from Docker Hub ──────────────────────────
       - name: Pull Docker image
         run: docker pull pcornetqf/qf-r-base:latest
 
-      # ── 5. Install Trivy directly via official install script ─────────────
+      # ═══════════════════════════════════════════════════════════════════════
+      #  TRIVY
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 5. Install Trivy ──────────────────────────────────────────────────
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
@@ -47,38 +55,24 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl \
             -o trivy-templates/html.tpl
 
-      # ── 7. Generate HTML report via direct Trivy CLI call ─────────────────
-      - name: Run Trivy scanner (HTML output)
+      # ── 7. Run Trivy — HTML report ────────────────────────────────────────
+      - name: Trivy scan (HTML output)
         run: |
           trivy image \
             --format template \
             --template "@trivy-templates/html.tpl" \
-            --output "scan-results/trivy-report_${{ env.DATETIME }}.html" \
+            --output "scan-results/trivy/trivy-report_${{ env.DATETIME }}.html" \
             --vuln-type os,library \
             --severity CRITICAL,HIGH,MEDIUM,LOW \
             --exit-code 0 \
             pcornetqf/qf-r-base:latest
 
-      # ── 8. Install Chromium for PDF conversion ────────────────────────────
-      - name: Install Chromium
+      # ── 8. Run Trivy — table summary to job log ───────────────────────────
+      - name: Trivy scan (log output)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y chromium-browser
-
-      # ── 9. Convert HTML → PDF ─────────────────────────────────────────────
-      - name: Convert HTML report to PDF
-        run: |
-          chromium-browser \
-            --headless \
-            --no-sandbox \
-            --disable-gpu \
-            --print-to-pdf="scan-results/trivy-report_${{ env.DATETIME }}.pdf" \
-            --print-to-pdf-no-header \
-            "$(pwd)/scan-results/trivy-report_${{ env.DATETIME }}.html"
-
-      # ── 10. Print summary table to job log ────────────────────────────────
-      - name: Run Trivy scanner (table log output)
-        run: |
+          echo "========================================"
+          echo "         TRIVY SCAN RESULTS"
+          echo "========================================"
           trivy image \
             --format table \
             --vuln-type os,library \
@@ -86,27 +80,227 @@ jobs:
             --exit-code 0 \
             pcornetqf/qf-r-base:latest
 
-      # ── 11. Commit and push reports to repo ───────────────────────────────
+      # ═══════════════════════════════════════════════════════════════════════
+      #  SYFT — Software Bill of Materials → CSV
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 9. Install Syft ───────────────────────────────────────────────────
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      # ── 10. Run Syft — generate SBOM JSON ────────────────────────────────
+      - name: Syft scan (SBOM JSON)
+        run: |
+          echo "========================================"
+          echo "         SYFT SBOM RESULTS"
+          echo "========================================"
+          syft pcornetqf/qf-r-base:latest \
+            -o spdx-json \
+            > "scan-results/syft/sbom_${{ env.DATETIME }}.json"
+
+          # Print summary to job log
+          syft pcornetqf/qf-r-base:latest -o table
+
+      # ── 11. Convert SBOM JSON → CSV using jq ─────────────────────────────
+      - name: Convert SBOM to CSV
+        run: |
+          # Install jq if not already present
+          sudo apt-get install -y jq
+
+          # Write CSV header
+          echo "Name,Version,Type,Language,License,PURL" \
+            > "scan-results/syft/sbom_${{ env.DATETIME }}.csv"
+
+          # Parse each package from the SBOM JSON and write as CSV rows
+          jq -r '
+            .packages[] |
+            [
+              (.name // "" | gsub(","; ";")),
+              (.versionInfo // "" | gsub(","; ";")),
+              (.primaryPackagePurpose // "" | gsub(","; ";")),
+              (.annotations[]?.comment // "" | select(startswith("language:"))
+                | ltrimstr("language:") | gsub(","; ";")) // "",
+              (
+                if .licenseConcluded != null and
+                   .licenseConcluded != "NOASSERTION" and
+                   .licenseConcluded != "NONE"
+                then .licenseConcluded
+                elif .licenseDeclared != null and
+                     .licenseDeclared != "NOASSERTION" and
+                     .licenseDeclared != "NONE"
+                then .licenseDeclared
+                else "N/A"
+                end | gsub(","; ";")
+              ),
+              (
+                (.externalRefs // []) |
+                map(select(.referenceType == "purl")) |
+                first | .referenceLocator // ""
+              )
+            ] | @csv
+          ' "scan-results/syft/sbom_${{ env.DATETIME }}.json" \
+            >> "scan-results/syft/sbom_${{ env.DATETIME }}.csv"
+
+          # Print row count to log
+          echo "CSV rows written: $(wc -l < scan-results/syft/sbom_${{ env.DATETIME }}.csv)"
+
+      # ═══════════════════════════════════════════════════════════════════════
+      #  GRYPE — Vulnerability scan against Syft SBOM
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 12. Install Grype ─────────────────────────────────────────────────
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      # ── 13. Run Grype — scan the Syft SBOM ───────────────────────────────
+      - name: Grype scan (from SBOM)
+        run: |
+          echo "========================================"
+          echo "         GRYPE SCAN RESULTS"
+          echo "========================================"
+
+          # Table output to job log
+          grype "sbom:scan-results/syft/sbom_${{ env.DATETIME }}.json" \
+            --output table \
+            --fail-on ""
+
+          # Save table report to repo
+          grype "sbom:scan-results/syft/sbom_${{ env.DATETIME }}.json" \
+            --output table \
+            --fail-on "" \
+            > "scan-results/grype/grype-report_${{ env.DATETIME }}.txt"
+
+          # Save JSON report to repo (machine-readable)
+          grype "sbom:scan-results/syft/sbom_${{ env.DATETIME }}.json" \
+            --output json \
+            --fail-on "" \
+            > "scan-results/grype/grype-report_${{ env.DATETIME }}.json"
+
+      # ═══════════════════════════════════════════════════════════════════════
+      #  CLAMAV — Malware / Trojan signature scanning
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 14. Install ClamAV ────────────────────────────────────────────────
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clamav clamav-daemon
+          sudo systemctl stop clamav-freshclam || true
+
+      # ── 15. Update ClamAV virus definitions ───────────────────────────────
+      - name: Update ClamAV virus definitions
+        run: sudo freshclam --verbose
+        continue-on-error: true
+
+      # ── 16. Export Docker image filesystem for ClamAV ─────────────────────
+      - name: Export Docker image filesystem
+        run: |
+          docker export $(docker create --name temp-container pcornetqf/qf-r-base:latest) \
+            -o image.tar
+          tar -xf image.tar -C image-contents
+          docker rm temp-container
+
+      # ── 17. Run ClamAV scan ───────────────────────────────────────────────
+      - name: ClamAV malware scan
+        run: |
+          echo "========================================"
+          echo "         CLAMAV SCAN RESULTS"
+          echo "========================================"
+
+          sudo clamscan \
+            --recursive \
+            --infected \
+            --bell \
+            --log="scan-results/clamav/clamav-report_${{ env.DATETIME }}.txt" \
+            image-contents/ || true
+
+          cat "scan-results/clamav/clamav-report_${{ env.DATETIME }}.txt"
+
+          # Fail the job if any infected files were found
+          if grep -q "Infected files: [^0]" \
+            "scan-results/clamav/clamav-report_${{ env.DATETIME }}.txt"; then
+            echo "::error::⚠️  ClamAV detected malware in the Docker image!"
+            exit 1
+          fi
+
+      # ═══════════════════════════════════════════════════════════════════════
+      #  PDF CONVERSION
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 18. Install Chromium ──────────────────────────────────────────────
+      - name: Install Chromium
+        run: sudo apt-get install -y chromium-browser
+
+      # ── 19. Convert Trivy HTML → PDF ─────────────────────────────────────
+      - name: Convert Trivy HTML report to PDF
+        run: |
+          chromium-browser \
+            --headless \
+            --no-sandbox \
+            --disable-gpu \
+            --print-to-pdf="scan-results/trivy/trivy-report_${{ env.DATETIME }}.pdf" \
+            --print-to-pdf-no-header \
+            "$(pwd)/scan-results/trivy/trivy-report_${{ env.DATETIME }}.html"
+
+      # ═══════════════════════════════════════════════════════════════════════
+      #  COMMIT ALL RESULTS TO REPO
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 20. Commit all scan results ───────────────────────────────────────
       - name: Commit scan results to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add scan-results/
-          git commit -m "scan: add vulnerability report for ${{ env.DATETIME }}"
+          git commit -m "scan: add full vulnerability report for ${{ env.DATETIME }}"
           git push
 
-      # ── 12. Upload HTML artifact ──────────────────────────────────────────
-      - name: Upload HTML report
+      # ═══════════════════════════════════════════════════════════════════════
+      #  UPLOAD ARTIFACTS
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── 21. Upload Trivy HTML artifact ────────────────────────────────────
+      - name: Upload Trivy HTML report
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report-html_${{ env.DATETIME }}
-          path: scan-results/trivy-report_${{ env.DATETIME }}.html
+          path: scan-results/trivy/trivy-report_${{ env.DATETIME }}.html
           retention-days: 30
 
-      # ── 13. Upload PDF artifact ───────────────────────────────────────────
-      - name: Upload PDF report
+      # ── 22. Upload Trivy PDF artifact ─────────────────────────────────────
+      - name: Upload Trivy PDF report
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report-pdf_${{ env.DATETIME }}
-          path: scan-results/trivy-report_${{ env.DATETIME }}.pdf
+          path: scan-results/trivy/trivy-report_${{ env.DATETIME }}.pdf
+          retention-days: 30
+
+      # ── 23. Upload Syft CSV artifact ──────────────────────────────────────
+      - name: Upload Syft SBOM CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: syft-sbom-csv_${{ env.DATETIME }}
+          path: scan-results/syft/sbom_${{ env.DATETIME }}.csv
+          retention-days: 30
+
+      # ── 24. Upload Grype report artifact ──────────────────────────────────
+      - name: Upload Grype report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-report_${{ env.DATETIME }}
+          path: |
+            scan-results/grype/grype-report_${{ env.DATETIME }}.txt
+            scan-results/grype/grype-report_${{ env.DATETIME }}.json
+          retention-days: 30
+
+      # ── 25. Upload ClamAV report artifact ─────────────────────────────────
+      - name: Upload ClamAV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: clamav-report_${{ env.DATETIME }}
+          path: scan-results/clamav/clamav-report_${{ env.DATETIME }}.txt
           retention-days: 30
